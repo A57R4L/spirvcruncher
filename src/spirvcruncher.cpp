@@ -70,8 +70,8 @@ static bool saveBinaryToArray(const vector<uint8_t>& data,
 
 	output << "\n};\n\n";
 	output << std::dec;
-	output << "const unsigned int " << arrayName << "_size = " << data.size() << ";\n";
-	output << "const unsigned int " << arrayName << "_decoded_size = " << decodedsize << "; \n";
+	output << "const size_t " << arrayName << "_encoded_sizeInBytes = " << data.size() << ";\n";
+	output << "const size_t " << arrayName << "_sizeInBytes = " << decodedsize << "; \n";
 
 	return true;
 }
