@@ -19,6 +19,8 @@
 using namespace std;
 using namespace smolv;
 
+size_t headerToSkip = 24;
+
 static bool loadBinaryFile(const string& inFilePath, vector<uint8_t>& output)
 {
 	ifstream input(inFilePath, ios::binary);
@@ -333,7 +335,6 @@ static bool generateUberHeader(
 
 		// Skip shader binary header - we hardcode the mandatory few bytes later
 
-		size_t headerToSkip = 24;
 		size_t dataSizeNoHeader = data.size() - headerToSkip;
 
 		outputFile << "#pragma data_seg.(\"." << arrayName << "\")\n";
@@ -587,7 +588,7 @@ int main(int argc, char* argv[])
 		//templateFile.close();
 		outFile.close();
 
-		if (!bSilent) cout << "Finished spirvcrunching shader: " << filenameOut << std::endl;
+		if (!bSilent) cout << "Finished spirvcrunching shader: " << filenameOut << " Original binary: " << spirv.size() << " Decoded binary: " << decodedSize << " Spirvcruncher data: " << smolv.size() - headerToSkip << std::endl;
 	}
 	/*
 	if (bResult)
