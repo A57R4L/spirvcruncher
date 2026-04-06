@@ -1,12 +1,14 @@
 //
 // spirvcruncher packs spir-v binaries using forked smol-v library
 // output is a single header with packed shader binary code and decompress function (decrunch)
-// code and binary output is optimized to be packed with the final executable using a tool like crinkler
+// code and binary output is optimized to be packed with the final executable using additional packer (ie. crinkler)
 //
 // Usage:
 // 
-//		decrunch(uint8_t* spirvCode);
+//		void decrunch(const uint8_t* packed_bytes, const uint8_t* packed_bytes_end, uint32_t spvVersion, uint32_t spvBound, uint8_t* spirvCode)
 // 
+//		or DECRUNCH_ALL_SHADERS macro
+//
 //		* Outputs spirv binary, provide enough available memory as in the shader part of the header
 //
 // Notes:
@@ -14,8 +16,7 @@
 // Spirvcruncher decode doesn't have any failsafes or tests as in the original smol-v library in the favor
 // of the size-optimized code. The decrunch-function is optimized during the packing process and likely
 // won't succesfully decode any other binaries. The cruncher runs decode function and strips all
-// unneeded functions. If needed, it should be trivial to make spirvcruncher support multiple shader files with
-// single decoding function.
+// unneeded functions. 
 // 
 
 #pragma once
@@ -902,32 +903,29 @@ inline uint32_t smolv_DecodeLen(SpvOp op, uint32_t len)
 	return len;
 }
 
-void decrunch(uint8_t* spirvCode)
+void decrunch(const uint8_t* packed_bytes, const uint8_t* packed_bytes_end, uint32_t spvVersion, uint32_t spvBound, uint8_t* spirvCode)
 {
-	// >>>>> SPIRVCRUNCHER Decrunch Segment
-	// These will be replaced during code generation // SPIRVCRUNCHER skip on build
-	const uint8_t* bytes = 1024; // SPIRVCRUNCHER skip on build
-	const uint8_t* bytesEnd = bytes + 256; // SPIRVCRUNCHER skip on build
-	// Header // SPIRVCRUNCHER skip on build
-	*(uint32_t*)spirvCode = 0x07230203; // Magic number (mandatory) // SPIRVCRUNCHER skip on build
-	spirvCode += 4; // SPIRVCRUNCHER skip on build
-	*(uint32_t*)spirvCode = 0x00010105; // Version (mandatory) // SPIRVCRUNCHER skip on build
-	spirvCode += 8; // skip Generator (not mandatory) // SPIRVCRUNCHER skip on build
-	*(uint32_t*)spirvCode = 0x00000036; // Bound (mandatory) // SPIRVCRUNCHER skip on build
-	spirvCode += 8; // skip Schema (not used?) // SPIRVCRUNCHER skip on build
+
+	// SPIR-V Header
+	*(uint32_t*)spirvCode = 0x07230203; // Magic number (mandatory)
+	spirvCode += 4; 
+	*(uint32_t*)spirvCode = spvVersion; // Version (mandatory)
+	spirvCode += 8; // skip Generator (not mandatory)
+	*(uint32_t*)spirvCode = spvBound; // Bound (mandatory)
+	spirvCode += 8; // skip Schema (not used?)
 
 	uint32_t val;
 	uint32_t prevResult = 0;
 	uint32_t prevDecorate = 0;
 
-	while (bytes < bytesEnd)
+	while (packed_bytes < packed_bytes_end)
 	{
 		// read length + opcode
 		
 		SpvOp op;
 		
 		// Inline opt
-		uint32_t instrLen = smolv_ReadVarint(bytes, bytesEnd); // , instrLen);
+		uint32_t instrLen = smolv_ReadVarint(packed_bytes, packed_bytes_end); // , instrLen);
 		op = (SpvOp)(((instrLen >> 4) & 0xFFF0) | (instrLen & 0xF));
 		instrLen = ((instrLen >> 20) << 4) | ((instrLen >> 4) & 0xF);
 		op = smolv_RemapOp(op);
@@ -949,7 +947,7 @@ void decrunch(uint8_t* spirvCode)
 // >>>>> SPIRVCRUNCHER Block Start >>>>> smolv_OpHasType
 		if (kSpirvOpData[op].hasType != 0)
 		{
-			val = smolv_ReadVarint(bytes, bytesEnd);
+			val = smolv_ReadVarint(packed_bytes, packed_bytes_end);
 			smolv_Write4(spirvCode, val);
 			ioffs++;
 		}
@@ -958,7 +956,7 @@ void decrunch(uint8_t* spirvCode)
 // >>>>> SPIRVCRUNCHER Block Start >>>>> smolv_OpHasResult
 		if (kSpirvOpData[op].hasResult != 0)
 		{
-			val = smolv_ReadVarint(bytes, bytesEnd);
+			val = smolv_ReadVarint(packed_bytes, packed_bytes_end);
 			val = prevResult + smolv_ZigDecode(val);
 			smolv_Write4(spirvCode, val);
 			prevResult = val;
@@ -970,7 +968,7 @@ void decrunch(uint8_t* spirvCode)
 		//if (op == SpvOpDecorate || op == SpvOpMemberDecorate) // SPIRVCRUNCHER skip on build
 		if (op == (SpvOp)71 || op == (SpvOp)72)
 		{
-			val = smolv_ReadVarint(bytes, bytesEnd);
+			val = smolv_ReadVarint(packed_bytes, packed_bytes_end);
 			// "before zero" version did not use zig encoding for the value
 			val = prevDecorate + (smolv_ZigDecode(val));
 			smolv_Write4(spirvCode, val);
@@ -983,24 +981,24 @@ void decrunch(uint8_t* spirvCode)
 		// if (op == SpvOpMemberDecorate) // SPIRVCRUNCHER skip on build
 		if (op == (SpvOp)72)
 		{
-			int count = *bytes++;
+			int count = *packed_bytes++;
 			int prevIndex = 0;
 			int prevOffset = 0;
 			for (int m = 0; m < count; ++m)
 			{
 				// read member index
-				uint32_t memberIndex = smolv_ReadVarint(bytes, bytesEnd);
+				uint32_t memberIndex = smolv_ReadVarint(packed_bytes, packed_bytes_end);
 				memberIndex += prevIndex;
 				prevIndex = memberIndex;
 
 				// decoration (and length if not common/known)
-				uint32_t memberDec = smolv_ReadVarint(bytes, bytesEnd);
+				uint32_t memberDec = smolv_ReadVarint(packed_bytes, packed_bytes_end);
 				const int knownExtraOps = smolv_DecorationExtraOps(memberDec);
 				uint32_t memberLen;
 	// >>>>> SPIRVCRUNCHER BlockInBlock Start >>>>> BlockInBlock_knownExtraOpsCondition
 				if (knownExtraOps == -1)
 				{
-					memberLen = smolv_ReadVarint(bytes, bytesEnd);
+					memberLen = smolv_ReadVarint(packed_bytes, packed_bytes_end);
 					memberLen += 4;
 				}
 				else
@@ -1019,7 +1017,7 @@ void decrunch(uint8_t* spirvCode)
 				// Special case for Offset decorations
 				if (memberDec == 35) // Offset
 				{
-					val = smolv_ReadVarint(bytes, bytesEnd);
+					val = smolv_ReadVarint(packed_bytes, packed_bytes_end);
 					val += prevOffset;
 					smolv_Write4(spirvCode, val);
 					prevOffset = val;
@@ -1029,7 +1027,7 @@ void decrunch(uint8_t* spirvCode)
 				{
 					for (uint32_t i = 4; i < memberLen; ++i)
 					{
-						val = smolv_ReadVarint(bytes, bytesEnd);
+						val = smolv_ReadVarint(packed_bytes, packed_bytes_end);
 						smolv_Write4(spirvCode, val);
 					}
 				}
@@ -1043,14 +1041,14 @@ void decrunch(uint8_t* spirvCode)
 
 		for (int i = 0; i < relativeCount && ioffs < instrLen; ++i, ++ioffs)
 		{
-			val = smolv_ReadVarint(bytes, bytesEnd);
+			val = smolv_ReadVarint(packed_bytes, packed_bytes_end);
 			val = smolv_ZigDecode(val);
 			smolv_Write4(spirvCode, prevResult - val);
 		}
 
 		if (wasSwizzle && instrLen <= 9)
 		{
-			uint32_t swizzle = *bytes++;
+			uint32_t swizzle = *packed_bytes++;
 // >>>>> SPIRVCRUNCHER Block Start >>>>> wasSizzleInstrLen9_5
 			if (instrLen > 5) smolv_Write4(spirvCode, (swizzle >> 6) & 3);
 // >>>>> SPIRVCRUNCHER Block End >>>>> wasSizzleInstrLen9_5
@@ -1070,7 +1068,7 @@ void decrunch(uint8_t* spirvCode)
 			// read rest of words with variable encoding
 			for (; ioffs < instrLen; ++ioffs)
 			{
-				val = smolv_ReadVarint(bytes, bytesEnd);
+				val = smolv_ReadVarint(packed_bytes, packed_bytes_end);
 				smolv_Write4(spirvCode, val);
 			}
 		}
@@ -1082,8 +1080,8 @@ void decrunch(uint8_t* spirvCode)
 			for (; ioffs < instrLen; ++ioffs)
 			{
 				// Shorter Read4
-				val = (bytes[0]) | (bytes[1] << 8) | (bytes[2] << 16) | (bytes[3] << 24);
-				bytes += 4;
+				val = (packed_bytes[0]) | (packed_bytes[1] << 8) | (packed_bytes[2] << 16) | (packed_bytes[3] << 24);
+				packed_bytes += 4;
 				smolv_Write4(spirvCode, val);
 			}
 		}
@@ -1092,7 +1090,7 @@ void decrunch(uint8_t* spirvCode)
 }
 
 //
-// spirvcruncher (c) 2025 Ossi Luoto
+// spirvcruncher (c) 2025-2026 Ossi Luoto
 //
 
 // Licence for smol-v

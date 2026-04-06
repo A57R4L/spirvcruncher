@@ -13,13 +13,27 @@
 #include <chrono>
 #include <ctime>
 #include <iomanip>
+#include <filesystem>
 
 #include "generated_shadertemplate.h"
 
 using namespace std;
 using namespace smolv;
+namespace fs = std::filesystem;
 
 size_t headerToSkip = 24;
+
+struct ShaderInput {
+	string filename;
+	string arrayName;
+};
+
+struct EncodedShader {
+	string name;
+	ByteArray spirv;
+	ByteArray smolv;
+	size_t decodedSize;
+};
 
 static bool loadBinaryFile(const string& inFilePath, vector<uint8_t>& output)
 {
@@ -126,7 +140,7 @@ static bool checkEntryFromSpv(DecodeAnalysis& analysis, string entryCheck)
 	return bResult;
 }
 
-static bool copyTemplateWithConditions(istringstream& templateFile, ofstream& outputFile, DecodeAnalysis& analysis, const string& arrayName, const vector<uint8_t>& data)
+static bool copyTemplateWithConditions(istringstream& templateFile, ofstream& outputFile, DecodeAnalysis& analysis, bool bSkipOptimizer)
 {
 	string line;
 	int lineNumber = 0;
@@ -153,7 +167,7 @@ static bool copyTemplateWithConditions(istringstream& templateFile, ofstream& ou
 			bBlockSegment = true;
 
 			// Check if we have this segment in our database
-			bBlockModeOn = checkEntryFromBlocks(analysis, line);
+			bBlockModeOn = checkEntryFromBlocks(analysis, line) || bSkipOptimizer;
 			continue;  // Skip the declaration lines
 		}
 
@@ -176,34 +190,6 @@ static bool copyTemplateWithConditions(istringstream& templateFile, ofstream& ou
 		{
 			bBlockSegment = false;
 			bBlockModeOn = false;
-			continue;
-		}
-
-		// Special case: decruncher start
-		if (line.find("SPIRVCRUNCHER Decrunch Segment") != string::npos)
-		{
-			outputFile << "	const uint8_t* bytes = " << arrayName << ";\n";
-			outputFile << "	const uint8_t* bytesEnd = bytes + " << arrayName << "_encoded_sizeInBytes;\n";
-
-			outputFile << "	// Header\n";
-			outputFile << "	*(uint32_t*)spirvCode = 0x07230203; // Magic number (mandatory)\n";
-			outputFile << "	spirvCode += 4;\n";
-			outputFile << "	*(uint32_t*)spirvCode = 0x00" <<
-				std::hex << std::setw(2) << std::setfill('0') << static_cast<int>(data[7]) <<
-				std::hex << std::setw(2) << std::setfill('0') << static_cast<int>(data[6]) <<
-				std::hex << std::setw(2) << std::setfill('0') << static_cast<int>(data[5]) <<
-				std::dec << std::setw(0) << std::setfill(' ') << "; // Version (mandatory)\n";
-			outputFile << "	spirvCode += 8; // skip Generator (not mandatory)\n";
-			outputFile << "	*(uint32_t*)spirvCode = 0x" <<
-
-				std::hex << std::setw(2) << std::setfill('0') << static_cast<int>(data[15]) <<
-				std::hex << std::setw(2) << std::setfill('0') << static_cast<int>(data[14]) <<
-				std::hex << std::setw(2) << std::setfill('0') << static_cast<int>(data[13]) <<
-				std::hex << std::setw(2) << std::setfill('0') << static_cast<int>(data[12]) <<
-				std::dec << std::setw(0) << std::setfill(' ') << "; // Bound (mandatory)\n";
-			outputFile << "	spirvCode += 8; // skip Schema (not used?)\n";
-			outputFile << std::dec << std::setw(0);
-
 			continue;
 		}
 
@@ -238,7 +224,7 @@ static bool copyTemplateWithConditions(istringstream& templateFile, ofstream& ou
 			if (!bBlockInBlock && line.find("SPIRVCRUNCHER BlockInBlock Start") != string::npos)
 			{
 				bBlockInBlock = true;
-				bBlockInBlockModeOn = checkEntryFromBlocks(analysis, line);
+				bBlockInBlockModeOn = checkEntryFromBlocks(analysis, line) || bSkipOptimizer;
 				continue;
 			}
 
@@ -260,7 +246,8 @@ static bool copyTemplateWithConditions(istringstream& templateFile, ofstream& ou
 		// In Spvmode, check if have the op in question in our database, else fill with empty
 		if (bSpvSegment)
 		{
-			if (checkEntryFromSpv(analysis, to_string(spvLineNumber)))
+			// Check analysis, or copy also if we are skipping optimizer altogether
+			if (checkEntryFromSpv(analysis, to_string(spvLineNumber)) || bSkipOptimizer)
 			{
 				outputFile << line << '\n';
 			}
@@ -289,11 +276,10 @@ static bool copyTemplateWithConditions(istringstream& templateFile, ofstream& ou
 
 static bool generateUberHeader(
 	istringstream& templateFile,
-	ofstream& outputFile, 
-	DecodeAnalysis& analysis, 
-	const string& arrayName,
-	const vector<uint8_t>& data,
-	size_t decodedsize)
+	ofstream& outputFile,
+	DecodeAnalysis& analysis,
+	const vector<EncodedShader>& shaders,
+	bool bSkipOptimizer, bool bSkipCruncher)
 {
 	bool bResult = true;
 
@@ -331,48 +317,105 @@ static bool generateUberHeader(
 	//
 	// 2. Shadercode
 	//
-	{
+	// First, check if all shaders share the same SPIR-V Version to optimize size
 
-		// Skip shader binary header - we hardcode the mandatory few bytes later
+	bool allVersionsMatch = true;
+	uint32_t sharedVersionWord = 0;
 
-		size_t dataSizeNoHeader = data.size() - headerToSkip;
+	for (size_t i = 0; i < shaders.size(); ++i) {
+		// Reconstruct the 32-bit version word correctly from little-endian bytes
+		uint32_t versionWord = shaders[i].spirv[4] |
+			(shaders[i].spirv[5] << 8) |
+			(shaders[i].spirv[6] << 16) |
+			(shaders[i].spirv[7] << 24);
 
-		outputFile << "#pragma data_seg(\"." << arrayName << "\")\n";
-		outputFile << "const uint8_t " << arrayName << "[] = {\n\n";
+		if (i == 0) sharedVersionWord = versionWord;
+		else if (versionWord != sharedVersionWord) allVersionsMatch = false;
+	}
+
+	if (allVersionsMatch && !shaders.empty()) {
+		outputFile << "constexpr uint32_t shared_spvVersion = 0x"
+			<< std::hex << std::setw(8) << std::setfill('0') << sharedVersionWord << std::dec << ";\n\n";
+	}
+
+	for (const auto& shader : shaders) {
+		// For debugging
+		size_t skipHeader = bSkipCruncher ? 0 : headerToSkip;
+		size_t dataSizeNoHeader = shader.smolv.size() - skipHeader;
+
+		outputFile << "#pragma data_seg(\"." << shader.name << "\")\n";
+		outputFile << "const uint8_t " << shader.name << "[] = {\n\n";
 
 		size_t count = 0;
 		for (size_t i = 0; i < dataSizeNoHeader; ++i) {
-			if (count % 12 == 0) {
-				outputFile << "    ";
-			}
+			if (count % 12 == 0) outputFile << "    ";
 
 			outputFile << "0x" << std::hex << std::setw(2) << std::setfill('0')
-				<< static_cast<int>(data[i + headerToSkip]);
+				<< static_cast<int>(shader.smolv[i + skipHeader]);
 
-			if (i != dataSizeNoHeader - 1) {
-				outputFile << ", ";
-			}
-
+			if (i != dataSizeNoHeader - 1) outputFile << ", ";
 			++count;
-
-			if (count % 12 == 0) {
-				outputFile << "\n";
-			}
+			if (count % 12 == 0) outputFile << "\n";
 		}
 
 		outputFile << "\n};\n\n";
-		outputFile << std::dec;
-		outputFile << "const size_t " << arrayName << "_encoded_sizeInBytes = " << dataSizeNoHeader << ";\n";
-		outputFile << "const size_t " << arrayName << "_sizeInBytes = " << decodedsize << "; \n\n";
 
+		outputFile << std::dec << std::setw(0) << std::setfill(' ');
+		outputFile << "constexpr size_t " << shader.name << "_encoded_sizeInBytes = " << dataSizeNoHeader << ";\n";
+		outputFile << "constexpr size_t " << shader.name << "_sizeInBytes = " << shader.decodedSize << "; \n";
+
+		if (!bSkipCruncher)
+		{
+			if (!allVersionsMatch) {
+				uint32_t versionWord = shader.spirv[4] | (shader.spirv[5] << 8) | (shader.spirv[6] << 16) | (shader.spirv[7] << 24);
+				outputFile << "constexpr uint32_t " << shader.name << "_spvVersion = 0x"
+					<< std::hex << std::setw(8) << std::setfill('0') << versionWord << std::dec << ";\n";
+			}
+
+			// Reconstruct Bound correctly
+			uint32_t boundWord = shader.spirv[12] | (shader.spirv[13] << 8) | (shader.spirv[14] << 16) | (shader.spirv[15] << 24);
+			outputFile << "constexpr uint32_t " << shader.name << "_spvBound = 0x"
+				<< std::hex << std::setw(8) << std::setfill('0') << boundWord << std::dec << ";\n";
+		}
+
+		// Allocate zero-initialized 32-bit aligned space
+		size_t bufferWords = (shader.decodedSize + 3) / 4;
+		outputFile << "inline uint32_t " << shader.name << "_buffer[" << bufferWords << "] = {};\n\n";
 	}
 
-	//
-	// 3. Decode part
-	//
-
+	// Generate debug "decoder" and macro
+	if (bSkipCruncher)
 	{
-		bResult = copyTemplateWithConditions(templateFile, outputFile, analysis, arrayName, data);
+		outputFile << "// BYPASS MODE: smol-v decrunch skipped. Doing raw 32-bit copy.\n";
+		outputFile << "inline void decrunch_bypass(const uint8_t* src, size_t sizeInBytes, uint32_t* dst) {\n";
+		outputFile << "\tconst uint32_t* src32 = (const uint32_t*)src;\n";
+		outputFile << "\tfor (size_t i = 0; i < sizeInBytes / 4; ++i) {\n";
+		outputFile << "\t\tdst[i] = src32[i];\n";
+		outputFile << "\t}\n";
+		outputFile << "}\n\n";
+
+		outputFile << "#define DECRUNCH_ALL_SHADERS() \\\n";
+		for (size_t i = 0; i < shaders.size(); ++i) {
+			const auto& s = shaders[i];
+			outputFile << "\tdecrunch_bypass(" << s.name << ", " << s.name << "_sizeInBytes, " << s.name << "_buffer)";
+			if (i < shaders.size() - 1) outputFile << "; \\\n";
+			else outputFile << "\n\n";
+		}
+	}
+	else
+	{
+		outputFile << "// Macro to decrunch all shaders into their respective buffers\n";
+		outputFile << "#define DECRUNCH_ALL_SHADERS() \\\n";
+		for (size_t i = 0; i < shaders.size(); ++i) {
+			const auto& s = shaders[i];
+			string v = allVersionsMatch ? "shared_spvVersion" : s.name + "_spvVersion";
+			outputFile << "\tdecrunch(" << s.name << ", " << s.name << " + " << s.name << "_encoded_sizeInBytes, " << v << ", " << s.name << "_spvBound, (uint8_t*)" << s.name << "_buffer)";
+			if (i < shaders.size() - 1) outputFile << "; \\\n";
+			else outputFile << "\n\n";
+		}
+
+		bResult = copyTemplateWithConditions(templateFile, outputFile, analysis, bSkipOptimizer);
+		if (!bResult) return false;
 	}
 
 	return true;
@@ -381,220 +424,163 @@ static bool generateUberHeader(
 
 int main(int argc, char* argv[])
 {
-	// Default variables for shader
-
-	string filenameIn;
-	string filenameOut = "spirvcrunchedshader.h";
-	string arrayName = "spirvcrunchedshader";
+	vector<ShaderInput> inputs;
+	string filenameOut = "spirvcrunchedshaders.h";
 	bool bStripEncodeFlags = false;
-
-	// Default variables for .h/.cpp
-
-	string fileOut_h = "smolv.h";
-	string fileOut_cpp = "smolv.cpp";
-
 	bool bSilent = false;
+	bool bSkipOptimizer = false;   // For sanity checking that the code optimizer is working as intended
+	bool bSkipCruncher = false;    // For sanity checking that smol-v packer is working, this means in practice that decrunch is just a copy operation
 
-	// Parse input arguments
+	string currentFile = "";
+	string currentName = "";
 
+	// Parse input arguments to allow multiple -i / -n pairs
 	for (int i = 1; i < argc; ++i) {
 		string arg = argv[i];
 
-		if ((arg == "-i" || arg == "--input") && i + 1 < argc) {
-			filenameIn = argv[++i];
-		}
-		else if ((arg == "-o" || arg == "--output") && i + 1 < argc) {
-			filenameOut = argv[++i];
-		}
-		else if ((arg == "-n" || arg == "--name") && i + 1 < argc) {
-			arrayName = argv[++i];
-		}
-		else if ((arg == "-d" || arg == "--stripdebuginfo")) {
-			bStripEncodeFlags = true;
-		}
-		else if ((arg == "-s" || arg == "--silent")) {
-			bSilent = true;
-		}
-		else if ((arg == "-h" || arg == "--output_h") && i + 1 < argc) {
-			fileOut_h = argv[++i];
-		}
-		else if ((arg == "-c" || arg == "--output_cpp") && i + 1 < argc) {
-			fileOut_cpp = argv[++i];
-		}
-		else {
-			cerr << "Unknown option or missing value: " << arg << endl;
-			return 1;
-		}
-	}
+		if (arg == "-i" || arg == "--input") {
+			if (i + 1 < argc) {
+				string val = argv[++i];
 
-	if (filenameIn.empty())
-	{
-		cerr << "Use " << argv[0] << " -i <input_shaderfile> [-o <output_headerfile>] [-n <arrayname>] [-d strip debug info] [-s silent]";
-		//<<
-		//	"[-u (single header with decoder, default)\n" <<
-		//	"[-m (multifile, shader.h, smolv.h, smol.cpp) [-h <output_decodeheaderfile>][-c <output_decodecppfile>]\n";
-		return 1;
-	}
-	
-	if (!bSilent) cout << "Running spirvcruncher for: " << filenameIn << endl;
+				// Handle wildcard inputs like "*.spv" or "data/*.spv"
+				if (val.find('*') != string::npos) {
+					fs::path p(val);
+					fs::path dir = p.parent_path();
+					if (dir.empty()) dir = "."; // Current directory
+					string ext = p.extension().string();
 
-	ByteArray spirv;
-	ByteArray smolv;
-	
-	bool bResult = true;
-
-	bResult = loadBinaryFile(filenameIn, spirv);
-
-	if (!bResult || spirv.empty())
-	{
-		cerr << "Failed to read: " << filenameIn << endl;
-		return 1;
-	}
-
-	if (!bSilent) cout << "Loading done" << endl;
-
-	// Encode to SMOL-V, optionally strip debug info
-
-	if (bResult)
-	{
-
-		if (!Encode(spirv.data(), spirv.size(), smolv, bStripEncodeFlags ? kEncodeFlagStripDebugInfo : 0))
-		{
-			cerr << "Failed to encode smolv: " << filenameIn << endl;
-			bResult = false;
-			return 1;
-		}
-	}
-
-	if (!bSilent) cout << "Encoding done" << endl;
-
-	// Create header file from encoded shader data
-	/*
-	if (bResult)
-	{
-		size_t decodedSize = GetDecodedBufferSize(smolv.data(), smolv.size());
-		cout << "Compressed to size: " << smolv.size() << " Expected to decode to: " << decodedSize << " Original size: " << spirv.size() << endl;
-	
-		if (!saveBinaryToArray(smolv, filenameOut, arrayName, decodedSize))
-		{
-			bResult = false;
-			cerr << "Failed to create output: " << filenameOut << endl;
-			return 1;
-		}
-	}
-	
-
-	if (bResult)
-	{
-		cout << " Shader include file: " << filenameOut << " created" << endl;
-	}
-	*/
-	// Run analyzer
-
-	DecodeAnalysis analysis;
-
-	if (bResult)
-	{
-		ByteArray returnspirv;
-		size_t decodedSize = GetDecodedBufferSize(smolv.data(), smolv.size());
-		if (decodedSize > 0)
-		{
-			returnspirv.resize(decodedSize);
-
-			if (DecodeWithAnalysis(smolv.data(), smolv.size(), returnspirv.data(), decodedSize, &analysis, kDecodeFlagNone))
-			{
-				for (auto block : analysis.Blocks)
-				{
-					if (!bSilent) cout << "Block: " << block.entry << " Amount: " << block.count << endl;
+					if (fs::exists(dir) && fs::is_directory(dir)) {
+						for (const auto& entry : fs::directory_iterator(dir)) {
+							if (entry.path().extension() == ext) {
+								inputs.push_back({ entry.path().string(), entry.path().stem().string() });
+							}
+						}
+					}
 				}
-
-				for (auto op : analysis.SpvOps)
-				{
-					if (!bSilent) cout << "Op: " << op.entry << " Amount: " << op.count << endl;
+				else {
+					// Handle normal single file input
+					if (!currentFile.empty()) {
+						inputs.push_back({ currentFile, currentName.empty() ? fs::path(currentFile).stem().string() : currentName });
+						currentName = "";
+					}
+					currentFile = val;
 				}
 			}
 		}
-
+		else if (arg == "-n" || arg == "--name") {
+			if (i + 1 < argc) currentName = argv[++i];
+		}
+		else if (arg == "-o" || arg == "--output") {
+			if (i + 1 < argc) filenameOut = argv[++i];
+		}
+		else if (arg == "-d" || arg == "--stripdebuginfo") {
+			bStripEncodeFlags = true;
+		}
+		else if (arg == "-s" || arg == "--silent") {
+			bSilent = true;
+		}
+		else if (arg == "--skipoptimizer") {
+			bSkipOptimizer = true;
+		}
+		else if (arg == "--skipcruncher") {
+			bSkipCruncher = true;
+			bSkipOptimizer = true;
+		}
+		else {
+			cerr << "Unknown option: " << arg << endl;
+			return 1;
+		}
 	}
 
-	/*
-	// Check .h/.cpp templates
-
-	if (bResult)
-	{
-		string exePath = getExecutableFolder();
-		ifstream template_h(exePath + "\\smolv_template.h");
-		ifstream template_cpp(exePath + "\\smolv_template.cpp");
-
-		ofstream outfile_h(fileOut_h);
-		ofstream outfile_cpp(fileOut_cpp);
-
-		if (!template_h || !template_cpp || !outfile_h || !outfile_cpp)
-		{
-			cerr << "Cannot open .h/.cpp files" << std::endl;
-			return 1;
-		}
-
-		bResult = copyTemplateWithConditions(template_h, outfile_h, analysis);
-		if (!bResult)
-		{
-			cerr << "Error creating .h file" << std::endl;
-			return 1;
-		}
-
-		template_h.close();
-		outfile_h.close();
-
-		bResult = copyTemplateWithConditions(template_cpp, outfile_cpp, analysis);
-		if (!bResult)
-		{
-			cerr << "Error creating .cpp file" << std::endl;
-			return 1;
-		}
-
-		template_cpp.close();
-		outfile_cpp.close();
-
+	// Push the final parsed input if it was a single file
+	if (!currentFile.empty()) {
+		inputs.push_back({ currentFile, currentName.empty() ? fs::path(currentFile).stem().string() : currentName });
 	}
-	*/
 
+	if (inputs.empty())
+	{
+		cerr << "Usage: " << argv[0] << " -i <shader1.spv> [-n <name1>] [-i <shader2.spv> [-n <name2>]] [-o <output_header>] [-d] [-s]\n";
+		return 1;
+	}
+
+	vector<EncodedShader> processedShaders;
+	DecodeAnalysis globalAnalysis;
+	bool bResult = true;
+
+	for (const auto& input : inputs) {
+		if (!bSilent) cout << "Processing: " << input.filename << " as " << input.arrayName << endl;
+
+		ByteArray spirv, smolv;
+		if (!loadBinaryFile(input.filename, spirv) || spirv.empty()) {
+			cerr << "Failed to read: " << input.filename << endl;
+			return 1;
+		}
+
+		size_t decodedSize = 0;
+
+		if (bSkipCruncher)
+		{
+			// just copy
+			smolv = spirv;
+			decodedSize = spirv.size();
+		}
+		else
+		{
+			// Encode to smol-v
+			if (!Encode(spirv.data(), spirv.size(), smolv, bStripEncodeFlags ? kEncodeFlagStripDebugInfo : 0)) {
+				cerr << "Failed to encode smolv: " << input.filename << endl;
+				return 1;
+			}
+
+			decodedSize = GetDecodedBufferSize(smolv.data(), smolv.size());
+			if (decodedSize > 0) {
+				ByteArray returnspirv;
+				returnspirv.resize(decodedSize);
+				DecodeAnalysis localAnalysis;
+
+				if (DecodeWithAnalysis(smolv.data(), smolv.size(), returnspirv.data(), decodedSize, &localAnalysis, kDecodeFlagNone)) {
+					// Merge local blocks into global
+					for (const auto& block : localAnalysis.Blocks) {
+						bool found = false;
+						for (auto& gBlock : globalAnalysis.Blocks) {
+							if (gBlock.entry == block.entry) { gBlock.count += block.count; found = true; break; }
+						}
+						if (!found) globalAnalysis.Blocks.push_back(block);
+					}
+
+					// Merge local ops into global
+					for (const auto& op : localAnalysis.SpvOps) {
+						bool found = false;
+						for (auto& gOp : globalAnalysis.SpvOps) {
+							if (gOp.entry == op.entry) { gOp.count += op.count; found = true; break; }
+						}
+						if (!found) globalAnalysis.SpvOps.push_back(op);
+					}
+				}
+			}
+		}
+		processedShaders.push_back({ input.arrayName, spirv, smolv, decodedSize });
+	}
+
+	// Output logic
 	if (bResult)
 	{
-		string exePath = getExecutableFolder();
-		
-		//ifstream templateFile(exePath + "\\spirvcruncher_template.h");
-		// From the generated header
-		istringstream templateFile(shadertemplate);
-
+		istringstream templateFile(shadertemplate); // From generated_shadertemplate.h
 		ofstream outFile(filenameOut);
 
-		if (!templateFile || !outFile)
-		{
+		if (!templateFile || !outFile) {
 			cerr << "Cannot open template or output files" << std::endl;
-			bResult = false;
 			return 1;
 		}
 
-		size_t decodedSize = GetDecodedBufferSize(smolv.data(), smolv.size());
-
-		bResult = generateUberHeader(templateFile, outFile, analysis, arrayName, smolv, decodedSize);
-		if (!bResult)
-		{
+		bResult = generateUberHeader(templateFile, outFile, globalAnalysis, processedShaders, bSkipOptimizer, bSkipCruncher);
+		if (!bResult) {
 			cerr << "Error creating .h file" << std::endl;
-			bResult = false;
 			return 1;
 		}
 
-		//templateFile.close();
-		outFile.close();
+		if (!bSilent) cout << "Successfully created combined header: " << filenameOut << " with " << processedShaders.size() << " shaders." << std::endl;
+	}
 
-		if (!bSilent) cout << "Finished spirvcrunching shader: " << filenameOut << " Original binary: " << spirv.size() << " Decoded binary: " << decodedSize << " Spirvcruncher data: " << smolv.size() - headerToSkip << std::endl;
-	}
-	/*
-	if (bResult)
-	{
-		if (!bSilent) cout << "Finished spirvcrunching succesfully!" << std::endl;
-	}
-	*/
-	return 0;
+	return bResult ? 0 : 1;
 }
