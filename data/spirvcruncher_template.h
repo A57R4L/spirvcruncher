@@ -374,7 +374,7 @@ enum SpvOp
 };
 
 // >>>>> SPIRVCRUNCHER Remove on build end
-typedef uint8_t SpvOp; // All special ops on query fit uint8_t
+typedef uint16_t SpvOp; // This actually needs to be uint16_t, not uint8_t
 
 struct OpData
 {
