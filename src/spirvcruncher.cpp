@@ -337,7 +337,7 @@ static bool generateUberHeader(
 
 		size_t dataSizeNoHeader = data.size() - headerToSkip;
 
-		outputFile << "#pragma data_seg.(\"." << arrayName << "\")\n";
+		outputFile << "#pragma data_seg(\"." << arrayName << "\")\n";
 		outputFile << "const uint8_t " << arrayName << "[] = {\n\n";
 
 		size_t count = 0;
