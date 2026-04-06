@@ -941,11 +941,17 @@ void decrunch(const uint8_t* packed_bytes, const uint8_t* packed_bytes_end, uint
 // >>>>> SPIRVCRUNCHER Block End >>>>> wasSwizzleVectorSuffle
 		smolv_Write4(spirvCode, (instrLen << 16) | op);
 
+		// We need fallback for extended op-codes - f.ex. raytrace stuff can be in thousands
+		OpData opInfo = { 0, 0, 0, 0 };
+		if (op < (sizeof(kSpirvOpData) / sizeof(kSpirvOpData[0]))) {
+			opInfo = kSpirvOpData[op];
+		}
+
 		size_t ioffs = 1;
 
 		// read type as varint, if we have it
 // >>>>> SPIRVCRUNCHER Block Start >>>>> smolv_OpHasType
-		if (kSpirvOpData[op].hasType != 0)
+		if (opInfo.hasType != 0)
 		{
 			val = smolv_ReadVarint(packed_bytes, packed_bytes_end);
 			smolv_Write4(spirvCode, val);
@@ -954,7 +960,7 @@ void decrunch(const uint8_t* packed_bytes, const uint8_t* packed_bytes_end, uint
 // >>>>> SPIRVCRUNCHER Block End >>>>> smolv_OpHasType
 		// read result as delta+varint, if we have it
 // >>>>> SPIRVCRUNCHER Block Start >>>>> smolv_OpHasResult
-		if (kSpirvOpData[op].hasResult != 0)
+		if (opInfo.hasResult != 0)
 		{
 			val = smolv_ReadVarint(packed_bytes, packed_bytes_end);
 			val = prevResult + smolv_ZigDecode(val);
@@ -1037,7 +1043,7 @@ void decrunch(const uint8_t* packed_bytes, const uint8_t* packed_bytes_end, uint
 // >>>>> SPIRVCRUNCHER Block End >>>>> SpvMemberDecorate
 
 		// Read this many IDs, that are relative to result ID
-		int relativeCount = kSpirvOpData[op].deltaFromResult;
+		int relativeCount = opInfo.deltaFromResult;
 
 		for (int i = 0; i < relativeCount && ioffs < instrLen; ++i, ++ioffs)
 		{
@@ -1063,7 +1069,7 @@ void decrunch(const uint8_t* packed_bytes, const uint8_t* packed_bytes_end, uint
 // >>>>> SPIRVCRUNCHER Block End >>>>> wasSizzleInstrLen9_8
 		}
 // >>>>> SPIRVCRUNCHER Block Start >>>>> OpvarRest
-		else if (kSpirvOpData[op].varrest != 0)
+		else if (opInfo.varrest != 0)
 		{
 			// read rest of words with variable encoding
 			for (; ioffs < instrLen; ++ioffs)
