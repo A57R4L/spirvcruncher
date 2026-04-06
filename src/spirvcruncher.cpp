@@ -338,12 +338,16 @@ static bool generateUberHeader(
 			<< std::hex << std::setw(8) << std::setfill('0') << sharedVersionWord << std::dec << ";\n\n";
 	}
 
+	// PASS 1: Group all packed bytes together in one Data Segment
+
+	outputFile << "// --- Compressed Shader Payloads ---\n";
+	outputFile << "#pragma data_seg(\".smolv\")\n\n";
+
 	for (const auto& shader : shaders) {
 		// For debugging
 		size_t skipHeader = bSkipCruncher ? 0 : headerToSkip;
 		size_t dataSizeNoHeader = shader.smolv.size() - skipHeader;
 
-		outputFile << "#pragma data_seg(\"." << shader.name << "\")\n";
 		outputFile << "const uint8_t " << shader.name << "[] = {\n\n";
 
 		size_t count = 0;
@@ -359,9 +363,41 @@ static bool generateUberHeader(
 		}
 
 		outputFile << "\n};\n\n";
+	}
+
+	// Reset data segment to default
+	outputFile << "#pragma data_seg()\n\n";
+
+	// PASS 2: Group all metadata together
+
+	outputFile << "// --- Metadata ---\n";
+	for (const auto& shader : shaders) {
+		size_t skipHeader = bSkipCruncher ? 0 : headerToSkip;
+		size_t dataSizeNoHeader = shader.smolv.size() - skipHeader;
 
 		outputFile << std::dec << std::setw(0) << std::setfill(' ');
 		outputFile << "constexpr size_t " << shader.name << "_encoded_sizeInBytes = " << dataSizeNoHeader << ";\n";
+		outputFile << "constexpr size_t " << shader.name << "_sizeInBytes = " << shader.decodedSize << ";\n";
+
+		if (!bSkipCruncher) {
+			if (!allVersionsMatch) {
+				uint32_t versionWord = shader.spirv[4] | (shader.spirv[5] << 8) | (shader.spirv[6] << 16) | (shader.spirv[7] << 24);
+				outputFile << "constexpr uint32_t " << shader.name << "_spvVersion = 0x"
+					<< std::hex << std::setw(8) << std::setfill('0') << versionWord << std::dec << ";\n";
+			}
+
+			uint32_t boundWord = shader.spirv[12] | (shader.spirv[13] << 8) | (shader.spirv[14] << 16) | (shader.spirv[15] << 24);
+			outputFile << "constexpr uint32_t " << shader.name << "_spvBound = 0x"
+				<< std::hex << std::setw(8) << std::setfill('0') << boundWord << std::dec << ";\n";
+		}
+		outputFile << "\n";
+	}
+
+
+
+	/*
+		outputFile << std::dec << std::setw(0) << std::setfill(' ');
+//		outputFile << "constexpr size_t " << shader.name << "_encoded_sizeInBytes = " << dataSizeNoHeader << ";\n";
 		outputFile << "constexpr size_t " << shader.name << "_sizeInBytes = " << shader.decodedSize << "; \n";
 
 		if (!bSkipCruncher)
@@ -377,11 +413,28 @@ static bool generateUberHeader(
 			outputFile << "constexpr uint32_t " << shader.name << "_spvBound = 0x"
 				<< std::hex << std::setw(8) << std::setfill('0') << boundWord << std::dec << ";\n";
 		}
+		*/
 
+	// PASS 3: Group all uninitialized buffers in the BSS Segment
+
+	outputFile << "// --- Uninitialized Memory Buffers (BSS) ---\n";
+	outputFile << "#pragma bss_seg(\".spirvbss\")\n\n";
+
+	for (const auto& shader : shaders) {
+		size_t bufferWords = (shader.decodedSize + 3) / 4;
+
+		outputFile << "inline uint32_t " << shader.name << "_buffer[" << bufferWords << "];\n";
+	}
+
+	// Reset bss segment to default
+	outputFile << "\n#pragma bss_seg()\n\n";
+
+	/*
 		// Allocate zero-initialized 32-bit aligned space
 		size_t bufferWords = (shader.decodedSize + 3) / 4;
 		outputFile << "inline uint32_t " << shader.name << "_buffer[" << bufferWords << "] = {};\n\n";
 	}
+	*/
 
 	// Generate debug "decoder" and macro
 	if (bSkipCruncher)
